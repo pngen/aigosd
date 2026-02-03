@@ -1,0 +1,18 @@
+[package]
+name = "aigosd"
+version = "1.0.0"
+edition = "2021"
+description = "AIGOS supervisor daemon - orchestrates governance layer processes across named meshes"
+license = "MIT"
+repository = "https://github.com/pngen/aigosd"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }
+serde_yml = "0.0.12"
+aigos = { path = "../aigos" }
+indexmap = { version = "2.7", features = ["serde"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
