@@ -54,7 +54,7 @@ No system directories are touched.
 All behavior is local to the folder where you run the daemon.
 
 ## Running
-Compile `aigos` first to bake canonical definitions.
+When building from source, compile `aigos` first to bake canonical definitions.
 Then compile `aigosd`:
 
 ```bash
