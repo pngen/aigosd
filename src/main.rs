@@ -2,27 +2,28 @@ use std::env;
 use std::path::PathBuf;
 use std::process;
 
-mod supervisor;
-mod logging;
 mod config;
+mod logging;
+mod signals;
+mod supervisor;
 mod systemd;
 mod windows;
 
 fn main() {
-let config_path = env::var("AIGOSD_CONFIG")
-    .map(PathBuf::from)
-    .unwrap_or_else(|_| {
-        let local = PathBuf::from("config.yaml");
-        if local.exists() {
-            return local;
-        }
+    let config_path = env::var("AIGOSD_CONFIG")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| {
+            let local = PathBuf::from("config.yaml");
+            if local.exists() {
+                return local;
+            }
 
-        if cfg!(windows) {
-            PathBuf::from(r"C:\ProgramData\aigos\config.yaml")
-        } else {
-            PathBuf::from("/etc/aigos/config.yaml")
-        }
-    });
+            if cfg!(windows) {
+                PathBuf::from(r"C:\ProgramData\aigos\config.yaml")
+            } else {
+                PathBuf::from("/etc/aigos/config.yaml")
+            }
+        });
 
     logging::info(&format!("Using config at: {}", config_path.display()));
 
@@ -37,8 +38,16 @@ let config_path = env::var("AIGOSD_CONFIG")
     logging::init(&cfg.options.logging, cfg.options.log_file.as_deref());
 
     let mut supervisor = supervisor::Supervisor::new(cfg);
-    if let Err(e) = supervisor.run() {
-        logging::error(&format!("Supervisor terminated: {}", e));
-        process::exit(2);
+    let exit_code = match supervisor.run() {
+        Ok(()) => 0,
+        Err(e) => {
+            logging::error(&format!("Supervisor terminated: {}", e));
+            2
+        }
+    };
+
+    drop(supervisor);
+    if exit_code != 0 {
+        process::exit(exit_code);
     }
 }
