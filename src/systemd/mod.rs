@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::Write;
 use std::path::Path;
 
+#[allow(dead_code)]
 pub fn generate_service_template(mesh_name: &str, layer_name: &str) -> String {
     format!(
         r#"[Unit]
@@ -30,7 +31,12 @@ WantedBy=multi-user.target
     )
 }
 
-pub fn write_service_file(output_dir: &Path, mesh_name: &str, layer_name: &str) -> std::io::Result<()> {
+#[allow(dead_code)]
+pub fn write_service_file(
+    output_dir: &Path,
+    mesh_name: &str,
+    layer_name: &str,
+) -> std::io::Result<()> {
     let content = generate_service_template(mesh_name, layer_name);
     let filename = format!("aigosd-{}@{}.service", mesh_name, layer_name);
     let path = output_dir.join(&filename);

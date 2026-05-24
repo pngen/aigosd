@@ -13,10 +13,12 @@ use std::process::Child;
 #[cfg(windows)]
 use std::ptr;
 
+#[allow(dead_code)]
 pub fn get_exe_name(mesh_name: &str, layer_name: &str) -> String {
     format!("aigosd-{}@{}.exe", mesh_name, layer_name)
 }
 
+#[allow(dead_code)]
 pub fn get_layer_exe_path(layer_name: &str) -> String {
     format!(".\\{}.exe", layer_name)
 }
@@ -139,6 +141,7 @@ impl Drop for JobObject {
 }
 
 #[cfg(windows)]
+#[allow(dead_code)]
 pub fn register_service(
     mesh_name: &str,
     layer_name: &str,
@@ -152,6 +155,7 @@ pub fn register_service(
 }
 
 #[cfg(not(windows))]
+#[allow(dead_code)]
 pub fn register_service(
     _mesh_name: &str,
     _layer_name: &str,

@@ -6,7 +6,13 @@ use std::time::SystemTime;
 static LOGGER: Mutex<Option<Logger>> = Mutex::new(None);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Level { Debug, Info, Warn, Error }
+pub enum Level {
+    #[allow(dead_code)]
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
 
 impl Level {
     fn as_str(&self) -> &'static str {
@@ -32,14 +38,21 @@ impl Logger {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         if self.structured {
-            format!(r#"{{"ts":{},"level":"{}","msg":"{}"}}"#, ts, level.as_str(), msg.replace('"', "\\\""))
+            format!(
+                r#"{{"ts":{},"level":"{}","msg":"{}"}}"#,
+                ts,
+                level.as_str(),
+                msg.replace('"', "\\\"")
+            )
         } else {
             format!("[{}] [{}] {}", ts, level.as_str(), msg)
         }
     }
 
     fn write(&mut self, level: Level, msg: &str) {
-        if (level as u8) < (self.min_level as u8) { return; }
+        if (level as u8) < (self.min_level as u8) {
+            return;
+        }
         let line = self.format_msg(level, msg);
         if let Some(ref mut f) = self.file {
             let _ = writeln!(f, "{}", line);
@@ -49,9 +62,7 @@ impl Logger {
 }
 
 pub fn init(log_type: &str, file_path: Option<&str>) {
-    let file = file_path.and_then(|p| {
-        OpenOptions::new().create(true).append(true).open(p).ok()
-    });
+    let file = file_path.and_then(|p| OpenOptions::new().create(true).append(true).open(p).ok());
     let logger = Logger {
         file,
         structured: log_type == "structured",
@@ -72,7 +83,16 @@ fn log(level: Level, msg: &str) {
     }
 }
 
-pub fn debug(msg: &str) { log(Level::Debug, msg); }
-pub fn info(msg: &str) { log(Level::Info, msg); }
-pub fn warn(msg: &str) { log(Level::Warn, msg); }
-pub fn error(msg: &str) { log(Level::Error, msg); }
+#[allow(dead_code)]
+pub fn debug(msg: &str) {
+    log(Level::Debug, msg);
+}
+pub fn info(msg: &str) {
+    log(Level::Info, msg);
+}
+pub fn warn(msg: &str) {
+    log(Level::Warn, msg);
+}
+pub fn error(msg: &str) {
+    log(Level::Error, msg);
+}
