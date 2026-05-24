@@ -82,6 +82,7 @@ pub struct MissingCoreLayersError {
 }
 
 impl MissingCoreLayersError {
+    #[allow(dead_code)]
     pub fn missing(&self) -> &[MissingCoreLayer] {
         &self.missing
     }
@@ -158,6 +159,7 @@ struct ProcessHandle {
     layer: String,
     mesh: String,
     child: Child,
+    #[allow(dead_code)]
     started_at: Instant,
     restart_count: u32,
     output_readers: Vec<thread::JoinHandle<()>>,
@@ -318,6 +320,7 @@ impl Supervisor {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn start_mesh(&mut self, mesh_name: &str) -> Result<(), Box<dyn Error>> {
         let layers: Vec<String> = if let Some(mesh_config) = self.config.meshes.get(mesh_name) {
             Self::layers_for_mesh(mesh_config)?
@@ -396,6 +399,7 @@ impl Supervisor {
         Ok(layers)
     }
 
+    #[allow(dead_code)]
     pub fn stop_mesh(&mut self, mesh_name: &str) {
         let prefix = format!("aigosd-{}@", mesh_name);
         let to_stop: Vec<_> = self
@@ -481,6 +485,7 @@ impl Supervisor {
         }
     }
 
+    #[allow(dead_code)]
     pub fn restart_mesh(&mut self, mesh_name: &str) -> Result<(), Box<dyn Error>> {
         self.stop_mesh(mesh_name);
         self.start_mesh(mesh_name)
@@ -582,6 +587,7 @@ impl Supervisor {
             .unwrap_or_else(|| Self::resolve_layer_binary(layer_name))
     }
 
+    #[allow(dead_code)]
     pub fn resolve_core_layers() -> Result<IndexMap<String, PathBuf>, MissingCoreLayersError> {
         Self::resolve_required_layers(canonical_core_layers().iter().copied())
     }
@@ -665,10 +671,12 @@ impl Supervisor {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn process_exists(&self, name: &str) -> bool {
         self.processes.contains_key(name)
     }
 
+    #[allow(dead_code)]
     pub fn health_check(&self, name: &str) -> bool {
         if let Some(handle) = self.processes.get(name) {
             handle.started_at.elapsed() > Duration::from_secs(1)
