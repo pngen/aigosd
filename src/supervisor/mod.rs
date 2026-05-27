@@ -1,4 +1,7 @@
-use aigos::{is_core_layer, is_extension_layer, is_valid_layer, CANONICAL_CORE_LAYERS};
+use aigos::{
+    is_core_layer, is_extension_layer, is_valid_layer, CANONICAL_CORE_LAYERS,
+    CANONICAL_EXTENSION_LAYERS,
+};
 use indexmap::IndexMap;
 use std::error::Error;
 use std::fmt;
@@ -30,8 +33,14 @@ const ESRCH: i32 = 3;
 #[cfg(test)]
 const TEST_EXTENSION_LAYERS: &[&str] = &["iam", "sck"];
 
+type PlannedMeshLayers = Vec<(String, Vec<String>)>;
+
 fn canonical_core_layers() -> &'static [&'static str] {
     CANONICAL_CORE_LAYERS
+}
+
+fn compiled_extension_layers() -> &'static [&'static str] {
+    CANONICAL_EXTENSION_LAYERS
 }
 
 #[cfg(test)]
@@ -244,16 +253,28 @@ impl Supervisor {
     }
 
     pub fn run(&mut self) -> Result<(), Box<dyn Error>> {
+        self.run_with_compiled_extensions(compiled_extension_layers())
+    }
+
+    fn run_with_compiled_extensions(
+        &mut self,
+        compiled_extension_layers: &[&str],
+    ) -> Result<(), Box<dyn Error>> {
         logging::info("Supervisor starting");
 
         signals::reset_shutdown();
         signals::install_shutdown_handler()?;
         let planned_mesh_layers = self.planned_mesh_layers()?;
+        let compiled_extension_binaries =
+            Self::resolve_compiled_extension_layers(compiled_extension_layers)?;
         self.layer_binaries = Self::resolve_required_layers(
             planned_mesh_layers
                 .iter()
                 .flat_map(|(_, layers)| layers.iter().map(String::as_str)),
         )?;
+        for (layer, path) in compiled_extension_binaries {
+            self.layer_binaries.insert(layer, path);
+        }
         self.ensure_windows_job()?;
 
         let result = self.run_supervision_loop(planned_mesh_layers);
@@ -265,7 +286,7 @@ impl Supervisor {
 
     fn run_supervision_loop(
         &mut self,
-        planned_mesh_layers: Vec<(String, Vec<String>)>,
+        planned_mesh_layers: PlannedMeshLayers,
     ) -> Result<(), Box<dyn Error>> {
         for (mesh_name, layers) in planned_mesh_layers {
             self.start_mesh_layers(&mesh_name, &layers)?;
@@ -347,7 +368,7 @@ impl Supervisor {
         Ok(())
     }
 
-    fn planned_mesh_layers(&self) -> Result<Vec<(String, Vec<String>)>, Box<dyn Error>> {
+    fn planned_mesh_layers(&self) -> Result<PlannedMeshLayers, Box<dyn Error>> {
         let mut planned = Vec::new();
         for (mesh_name, mesh_config) in &self.config.meshes {
             planned.push((mesh_name.clone(), Self::layers_for_mesh(mesh_config)?));
@@ -592,6 +613,12 @@ impl Supervisor {
         Self::resolve_required_layers(canonical_core_layers().iter().copied())
     }
 
+    fn resolve_compiled_extension_layers(
+        extension_layers: &[&str],
+    ) -> Result<IndexMap<String, PathBuf>, MissingCoreLayersError> {
+        Self::resolve_required_layers(extension_layers.iter().copied())
+    }
+
     fn resolve_required_layers<'a, I>(
         layers: I,
     ) -> Result<IndexMap<String, PathBuf>, MissingCoreLayersError>
@@ -699,7 +726,7 @@ mod tests {
     use indexmap::IndexMap;
     use std::env;
     use std::fs;
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::process::{self, Command};
     use std::sync::Mutex;
     use std::thread;
@@ -768,6 +795,61 @@ mod tests {
                 Some(&Supervisor::candidate_layer_paths(layer)[1])
             );
         }
+    }
+
+    #[test]
+    fn compiled_extension_preflight_passes_without_extensions() {
+        let _lock = CWD_LOCK.lock().expect("cwd lock");
+        let _runtime = RuntimeDir::new();
+
+        let resolved = Supervisor::resolve_compiled_extension_layers(&[])
+            .expect("empty compiled extension set should pass");
+
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn compiled_extension_preflight_rejects_missing_registered_binary() {
+        let _lock = CWD_LOCK.lock().expect("cwd lock");
+        let _runtime = RuntimeDir::new();
+
+        let err = Supervisor::resolve_compiled_extension_layers(&["iam"])
+            .expect_err("missing compiled extension should fail");
+        let missing = err.missing();
+
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].layer, "iam");
+        assert_eq!(
+            missing[0].attempted_paths,
+            Supervisor::candidate_layer_paths("iam")
+        );
+        assert!(err.to_string().contains("Missing required layer binaries"));
+    }
+
+    #[test]
+    fn compiled_extension_preflight_accepts_flat_binary() {
+        let _lock = CWD_LOCK.lock().expect("cwd lock");
+        let _runtime = RuntimeDir::new();
+        let expected_path = Supervisor::candidate_layer_paths("iam")[0].clone();
+        create_empty_executable(&expected_path);
+
+        let resolved = Supervisor::resolve_compiled_extension_layers(&["iam"])
+            .expect("flat extension binary should pass");
+
+        assert_eq!(resolved.get("iam"), Some(&expected_path));
+    }
+
+    #[test]
+    fn compiled_extension_preflight_accepts_nested_binary() {
+        let _lock = CWD_LOCK.lock().expect("cwd lock");
+        let _runtime = RuntimeDir::new();
+        let expected_path = Supervisor::candidate_layer_paths("iam")[1].clone();
+        create_empty_executable(&expected_path);
+
+        let resolved = Supervisor::resolve_compiled_extension_layers(&["iam"])
+            .expect("nested extension binary should pass");
+
+        assert_eq!(resolved.get("iam"), Some(&expected_path));
     }
 
     #[test]
@@ -1024,8 +1106,27 @@ options:
 
         let mut supervisor = Supervisor::new(test_config(Some(&["iam"])));
         let err = supervisor
-            .run()
+            .run_with_compiled_extensions(&[])
             .expect_err("missing configured extension binary should fail");
+
+        assert!(err.to_string().contains("Missing required layer binaries"));
+        assert!(err.to_string().contains("- iam (attempted:"));
+        assert!(supervisor.processes.is_empty());
+    }
+
+    #[test]
+    fn missing_compiled_extension_preflight_fails_before_spawn() {
+        let _lock = CWD_LOCK.lock().expect("cwd lock");
+        let _runtime = RuntimeDir::new();
+
+        for layer in canonical_core_layers() {
+            create_empty_executable(&Supervisor::candidate_layer_paths(layer)[0]);
+        }
+
+        let mut supervisor = Supervisor::new(test_config(None));
+        let err = supervisor
+            .run_with_compiled_extensions(&["iam"])
+            .expect_err("missing compiled extension should fail before spawn");
 
         assert!(err.to_string().contains("Missing required layer binaries"));
         assert!(err.to_string().contains("- iam (attempted:"));
@@ -1056,7 +1157,9 @@ options:
         create_empty_executable(&Supervisor::candidate_layer_paths(canonical_core_layers()[0])[0]);
 
         let mut supervisor = Supervisor::new(test_config(None));
-        let err = supervisor.run().expect_err("missing layers should fail");
+        let err = supervisor
+            .run_with_compiled_extensions(&[])
+            .expect_err("missing layers should fail");
         let missing = err
             .downcast_ref::<MissingCoreLayersError>()
             .expect("missing Core error");
@@ -1281,7 +1384,7 @@ options:
         }
     }
 
-    fn compile_sleeping_helper(runtime: &PathBuf) -> PathBuf {
+    fn compile_sleeping_helper(runtime: &Path) -> PathBuf {
         let source = runtime.join("sleeping_layer.rs");
         let output = runtime.join(if cfg!(windows) {
             "sleeping_layer.exe"
@@ -1311,7 +1414,7 @@ fn main() {
         output
     }
 
-    fn compile_output_helper(runtime: &PathBuf) -> PathBuf {
+    fn compile_output_helper(runtime: &Path) -> PathBuf {
         let source = runtime.join("output_layer.rs");
         let output = runtime.join(if cfg!(windows) {
             "output_layer.exe"
@@ -1422,7 +1525,6 @@ fn main() {
     #[cfg(windows)]
     fn process_is_running(pid: u32) -> bool {
         use std::ffi::c_void;
-        use std::ptr;
 
         const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
         const SYNCHRONIZE: u32 = 0x0010_0000;
@@ -1436,7 +1538,7 @@ fn main() {
 
         let handle =
             unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, 0, pid) };
-        if handle == ptr::null_mut() {
+        if handle.is_null() {
             return false;
         }
 

@@ -23,6 +23,8 @@ Place it anywhere, alongside its configuration and layer binaries, and run it.
 /icl.exe
 /gsas.exe
 /able.exe
+/iam.exe (if compiled as an extension)
+/sck.exe (if compiled as an extension)
 </pre>
 
 For backward compatibility, AIGOSD also accepts the original nested layout:
@@ -39,6 +41,8 @@ For backward compatibility, AIGOSD also accepts the original nested layout:
 /icl/icl.exe
 /gsas/gsas.exe
 /able/able.exe
+/iam/iam.exe (if compiled as an extension)
+/sck/sck.exe (if compiled as an extension)
 </pre>
 
 **Linux users**: If you downloaded binaries from the GitHub Releases page (e.g. `dio-linux-x86_64`), rename them to match canonical runtime form (`dio`) before running the daemon.
@@ -46,7 +50,7 @@ For backward compatibility, AIGOSD also accepts the original nested layout:
 AIGOSD performs four deterministic steps:
 1. Load `config.yaml` from the current working directory.
 2. Load canonical layer definitions baked in at compile time from the aigos library.
-3. Verify all ten mandatory Core layer binaries are present before spawning anything.
+3. Verify all ten mandatory Core layer binaries, plus any compiled-in extension binaries, are present before spawning anything.
 4. Launch all ten Core layers for each configured Core mesh as supervised subprocesses owned by AIGOSD.
 
 No global install paths are used.
@@ -77,7 +81,7 @@ On Windows:
 
 AIGOSD automatically discovers:
 - the local config
-- the compiled layer binaries in the same directory, with nested layer folders as a fallback
+- compiled layer binaries in the same directory, with nested layer folders as a fallback
 - canonical Core and extension names embedded at compile-time from the `aigos` world-model registry
 
 ## Configuration (`config.yaml`)
@@ -137,6 +141,8 @@ AIGOS Core runtime requires all ten Core layers. Core is all-or-none: partial Co
 Extensions are separate from mandatory Core and are additive unlocks. `config.yaml` cannot subtract from Core; it can only add recognized extension layers after Core.
 
 `aigos` is the canonical world-model registry. Adding an extension requires adding its canonical name to `CANONICAL_EXTENSION_LAYERS`, recompiling `aigosd`, and making the extension binary available to the runtime bundle.
+
+When `aigosd` is compiled with extension layers, every compiled-in extension executable must be present in the daemon's working tree before startup proceeds, either beside `aigosd` or in its matching named subfolder. Missing extension executables fail closed before any child process is spawned. Extra unregistered executables are ignored unless they are also recognized by the compiled registry and selected by configuration.
 
 ## Deterministic Logging
 AIGOSD writes structured or plaintext logs (as selected in options.logging) into the local directory where it is executed.
