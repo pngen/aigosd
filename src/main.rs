@@ -9,21 +9,14 @@ mod supervisor;
 mod systemd;
 mod windows;
 
-fn main() {
-    let config_path = env::var("AIGOSD_CONFIG")
+fn config_path() -> PathBuf {
+    env::var("AIGOSD_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            let local = PathBuf::from("config.yaml");
-            if local.exists() {
-                return local;
-            }
+        .unwrap_or_else(|_| PathBuf::from("config.yaml"))
+}
 
-            if cfg!(windows) {
-                PathBuf::from(r"C:\ProgramData\aigos\config.yaml")
-            } else {
-                PathBuf::from("/etc/aigos/config.yaml")
-            }
-        });
+fn main() {
+    let config_path = config_path();
 
     logging::info(&format!("Using config at: {}", config_path.display()));
 
@@ -49,5 +42,44 @@ fn main() {
     drop(supervisor);
     if exit_code != 0 {
         process::exit(exit_code);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn restore_env(previous: Option<OsString>) {
+        if let Some(value) = previous {
+            env::set_var("AIGOSD_CONFIG", value);
+        } else {
+            env::remove_var("AIGOSD_CONFIG");
+        }
+    }
+
+    #[test]
+    fn config_path_defaults_to_local_config_only() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let previous = env::var_os("AIGOSD_CONFIG");
+        env::remove_var("AIGOSD_CONFIG");
+
+        assert_eq!(config_path(), PathBuf::from("config.yaml"));
+
+        restore_env(previous);
+    }
+
+    #[test]
+    fn config_path_honors_explicit_environment_override() {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let previous = env::var_os("AIGOSD_CONFIG");
+        env::set_var("AIGOSD_CONFIG", "custom.yaml");
+
+        assert_eq!(config_path(), PathBuf::from("custom.yaml"));
+
+        restore_env(previous);
     }
 }
