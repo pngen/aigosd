@@ -18,8 +18,6 @@ fn config_path() -> PathBuf {
 fn main() {
     let config_path = config_path();
 
-    logging::info(&format!("Using config at: {}", config_path.display()));
-
     let cfg = match config::load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
@@ -28,10 +26,18 @@ fn main() {
         }
     };
 
-    logging::init(&cfg.options.logging, cfg.options.log_file.as_deref());
+    if let Err(error) = logging::init(&cfg.options.logging, cfg.options.log_file.as_deref()) {
+        eprintln!("[FATAL] Logger initialization failed: {}", error);
+        process::exit(1);
+    }
+    logging::info(&format!("Using config at: {}", config_path.display()));
+    if let Err(error) = logging::ensure_healthy() {
+        eprintln!("[FATAL] Initial daemon log write failed: {}", error);
+        process::exit(1);
+    }
 
     let mut supervisor = supervisor::Supervisor::new(cfg);
-    let exit_code = match supervisor.run() {
+    let mut exit_code = match supervisor.run() {
         Ok(()) => 0,
         Err(e) => {
             logging::error(&format!("Supervisor terminated: {}", e));
@@ -40,6 +46,12 @@ fn main() {
     };
 
     drop(supervisor);
+    if logging::write_failure_detected() {
+        eprintln!("[FATAL] One or more daemon log writes failed");
+        if exit_code == 0 {
+            exit_code = 3;
+        }
+    }
     if exit_code != 0 {
         process::exit(exit_code);
     }
