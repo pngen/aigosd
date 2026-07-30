@@ -8,6 +8,7 @@ repository = "https://github.com/pngen/aigosd"
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 serde_yml = "0.0.12"
 aigos = { path = "../aigos" }
 indexmap = { version = "2.7", features = ["serde"] }

@@ -3,10 +3,11 @@
 Supervisor daemon for the AI Governance Operating System.
 
 AIGOSD is the portable, cross-platform supervisor daemon for the AI Governance Operating System.
-It loads local configuration, launches governance layer binaries, and manages deterministic process lifecycles across named meshes.
+It loads operator-selected configuration, launches local governance layer binaries, and manages deterministic process lifecycles across named meshes.
 
-AIGOSD is self-contained: no installation, no system paths, no global directories.
-Place it anywhere, alongside its configuration and layer binaries, and run it.
+AIGOSD requires no installation, system paths, or global directories.
+By default, place it alongside its configuration and layer binaries and run it; an operator may
+explicitly select another configuration file with `AIGOSD_CONFIG`.
 
 ## Architecture
 **Preferred layout: place each compiled layer binary directly beside `aigosd`:**
@@ -48,14 +49,14 @@ For backward compatibility, AIGOSD also accepts the original nested layout:
 **Linux users**: If you downloaded binaries from the GitHub Releases page (e.g. `dio-linux-x86_64`), rename them to match canonical runtime form (`dio`) before running the daemon.
 
 AIGOSD performs four deterministic steps:
-1. Load `config.yaml` from the current working directory.
+1. Load `config.yaml` from the current working directory, unless `AIGOSD_CONFIG` explicitly selects another file.
 2. Load canonical layer definitions baked in at compile time from the aigos library.
 3. Verify all ten mandatory Core layer binaries, plus any compiled-in extension binaries, are present before spawning anything.
 4. Launch all ten Core layers for each configured Core mesh as supervised subprocesses owned by AIGOSD.
 
-No global install paths are used.
-No system directories are touched.
-All behavior is local to the folder where you run the daemon.
+No global install paths are used, and AIGOSD does not create or write global or system
+directories. Layer discovery and runtime outputs remain local to the working directory; only an
+explicitly overridden configuration input may be read from elsewhere.
 
 ## Running
 When building from source, compile `aigos` first to bake canonical definitions.
@@ -80,12 +81,12 @@ On Windows:
 ```
 
 AIGOSD automatically discovers:
-- the local config
+- the local config, unless `AIGOSD_CONFIG` explicitly selects another file
 - compiled layer binaries in the same directory, with nested layer folders as a fallback
 - canonical Core and extension names embedded at compile-time from the `aigos` world-model registry
 
 ## Configuration (`config.yaml`)
-A single file placed next to the daemon.
+A single file placed next to the daemon by default, or selected explicitly with `AIGOSD_CONFIG`.
 
 Example:
 
@@ -99,10 +100,23 @@ meshes:
 options:
   logging: structured
   restart: on-failure
+  log_file: aigosd.log
 ```
 
-**Meshes** are isolated groups of governance processes.
-AIGOSD launches each Core mesh independently, deterministically, and supervises all child processes until shutdown.
+`version` is optional for backward compatibility. When present it must be `"1.0.0"`.
+Unknown configuration fields are rejected so misspelled governance options cannot silently fall
+back to defaults. Mesh names must be 1-64 ASCII characters, begin with a letter or digit, and use
+only letters, digits, `_`, `.`, or `-`.
+
+`log_file` is optional. It must be a relative path whose existing parent directory resolves inside
+the daemon's working directory. Symbolic-link traversal and hard-linked or non-regular targets are
+rejected, and the opened file identity is rechecked before any record is written. If the requested
+file cannot be opened safely, AIGOSD fails startup; later write failures are reported on standard
+error and cause a nonzero shutdown.
+
+**Meshes** are independently managed lifecycle groups of governance processes; they are not
+filesystem, network, IPC, identity, or security sandboxes. AIGOSD launches each Core mesh
+deterministically and supervises all child processes until shutdown.
 
 `config.yaml` may name Core meshes and set daemon options, but it cannot select a subset of AIGOS Core. Omitting `layers` runs the mandatory ten-layer Core only.
 
@@ -147,11 +161,15 @@ When `aigosd` is compiled with extension layers, every compiled-in extension exe
 ## Deterministic Logging
 AIGOSD writes structured or plaintext logs (as selected in options.logging) into the local directory where it is executed.
 
+Structured records are JSON objects. Child output is encoded as data rather than interpolated into
+the JSON syntax.
+
 No system log directories are used.
 
 ## Portability
 AIGOSD requires no global install paths.
-It runs entirely from its working directory.
+It discovers layer binaries and writes runtime outputs in its working directory. Only an
+explicitly selected `AIGOSD_CONFIG` input may be read from elsewhere.
 
 AIGOSD is a **portable OS-level supervisor**:
 place it beside the Core layer binaries and run it.

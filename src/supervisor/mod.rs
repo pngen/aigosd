@@ -11,7 +11,7 @@ use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -21,6 +21,11 @@ use crate::signals;
 
 const HEALTH_CHECK_INTERVAL: Duration = Duration::from_secs(5);
 const RESTART_DELAY: Duration = Duration::from_secs(3);
+const STARTUP_CHECK_DELAY: Duration = Duration::from_millis(100);
+const INTERRUPT_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const OUTPUT_READER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+const PROCESS_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const MAX_OUTPUT_RECORD_BYTES: usize = 16 * 1024;
 #[cfg(unix)]
 const PROCESS_GROUP_TERM_TIMEOUT: Duration = Duration::from_secs(2);
 #[cfg(unix)]
@@ -128,7 +133,12 @@ fn configure_child_process_group(cmd: &mut Command) {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn configure_child_process_group(cmd: &mut Command) {
+    crate::windows::configure_command_suspended(cmd);
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn configure_child_process_group(_cmd: &mut Command) {}
 
 #[cfg(unix)]
@@ -142,15 +152,23 @@ fn kill_process_group(process_group_id: i32, signal: i32) -> io::Result<()> {
 }
 
 #[cfg(unix)]
-fn log_process_group_signal_error(signal_name: &str, handle: &ProcessHandle, error: io::Error) {
+fn process_group_signal_result(
+    signal_name: &str,
+    handle: &ProcessHandle,
+    result: io::Result<()>,
+) -> io::Result<()> {
+    let Err(error) = result else {
+        return Ok(());
+    };
     if error.raw_os_error() == Some(ESRCH) {
-        return;
+        return Ok(());
     }
 
     logging::warn(&format!(
         "Failed to send {} to process group {} for {}: {}",
         signal_name, handle.process_group_id, handle.name, error
     ));
+    Err(error)
 }
 
 pub struct Supervisor {
@@ -158,8 +176,6 @@ pub struct Supervisor {
     processes: IndexMap<String, ProcessHandle>,
     shutdown: Arc<AtomicBool>,
     layer_binaries: IndexMap<String, PathBuf>,
-    #[cfg(windows)]
-    job: Option<crate::windows::JobObject>,
 }
 
 struct ProcessHandle {
@@ -171,22 +187,65 @@ struct ProcessHandle {
     #[allow(dead_code)]
     started_at: Instant,
     restart_count: u32,
-    output_readers: Vec<thread::JoinHandle<()>>,
+    output_readers: Vec<OutputReader>,
     #[cfg(unix)]
     process_group_id: i32,
+    #[cfg(windows)]
+    job: Option<crate::windows::JobObject>,
+}
+
+struct OutputReader {
+    thread: Option<thread::JoinHandle<()>>,
+    completed: mpsc::Receiver<()>,
 }
 
 impl ProcessHandle {
-    fn join_output_readers(&mut self) {
-        for reader in self.output_readers.drain(..) {
-            if reader.join().is_err() {
-                logging::warn(&format!("Output reader thread panicked for {}", self.name));
+    fn join_output_readers(&mut self) -> io::Result<()> {
+        let mut errors = Vec::new();
+        for mut reader in self.output_readers.drain(..) {
+            if let Err(error) = reader.join_with_timeout(&self.name, OUTPUT_READER_JOIN_TIMEOUT) {
+                logging::error(&error.to_string());
+                errors.push(error.to_string());
             }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::new(io::ErrorKind::TimedOut, errors.join("; ")))
         }
     }
 }
 
-fn start_output_readers(process_name: &str, child: &mut Child) -> Vec<thread::JoinHandle<()>> {
+impl OutputReader {
+    fn join_with_timeout(&mut self, process_name: &str, timeout: Duration) -> io::Result<()> {
+        match self.completed.recv_timeout(timeout) {
+            Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => {
+                if self
+                    .thread
+                    .take()
+                    .is_some_and(|thread| thread.join().is_err())
+                {
+                    Err(io::Error::other(format!(
+                        "Output reader thread panicked for {}",
+                        process_name
+                    )))
+                } else {
+                    Ok(())
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "Timed out waiting for output reader shutdown for {}",
+                    process_name
+                ),
+            )),
+        }
+    }
+}
+
+fn start_output_readers(process_name: &str, child: &mut Child) -> Vec<OutputReader> {
     let mut readers = Vec::new();
 
     if let Some(stdout) = child.stdout.take() {
@@ -212,31 +271,78 @@ fn spawn_output_reader<R>(
     process_name: String,
     stream_name: &'static str,
     reader: BufReader<R>,
-) -> thread::JoinHandle<()>
+) -> OutputReader
 where
     R: io::Read + Send + 'static,
 {
-    thread::spawn(move || {
-        for line in reader.lines() {
-            match line {
-                Ok(line) => {
-                    let attributed = format!("[{}:{}] {}", process_name, stream_name, line);
-                    if stream_name == "stderr" {
-                        logging::error(&attributed);
-                    } else {
-                        logging::info(&attributed);
-                    }
-                }
-                Err(e) => {
-                    logging::warn(&format!(
-                        "[{}:{}] output reader failed: {}",
-                        process_name, stream_name, e
-                    ));
-                    break;
-                }
+    let (completed_tx, completed) = mpsc::channel();
+    let thread = thread::spawn(move || {
+        read_bounded_output(process_name, stream_name, reader);
+        let _ = completed_tx.send(());
+    });
+    OutputReader {
+        thread: Some(thread),
+        completed,
+    }
+}
+
+fn read_bounded_output<R>(process_name: String, stream_name: &'static str, mut reader: BufReader<R>)
+where
+    R: io::Read,
+{
+    let mut record = Vec::with_capacity(MAX_OUTPUT_RECORD_BYTES.min(1024));
+    let mut truncated = false;
+
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
+            Err(error) => {
+                logging::warn(&format!(
+                    "[{}:{}] output reader failed: {}",
+                    process_name, stream_name, error
+                ));
+                break;
             }
+        };
+
+        if available.is_empty() {
+            if !record.is_empty() || truncated {
+                log_output_record(&process_name, stream_name, &record, truncated);
+            }
+            break;
         }
-    })
+
+        let newline = available.iter().position(|byte| *byte == b'\n');
+        let consumed = newline.map_or(available.len(), |position| position + 1);
+        let payload_len = newline.unwrap_or(consumed);
+        let remaining = MAX_OUTPUT_RECORD_BYTES.saturating_sub(record.len());
+        let copied = remaining.min(payload_len);
+        record.extend_from_slice(&available[..copied]);
+        if copied < payload_len {
+            truncated = true;
+        }
+        reader.consume(consumed);
+
+        if newline.is_some() {
+            if record.last() == Some(&b'\r') {
+                record.pop();
+            }
+            log_output_record(&process_name, stream_name, &record, truncated);
+            record.clear();
+            truncated = false;
+        }
+    }
+}
+
+fn log_output_record(process_name: &str, stream_name: &str, record: &[u8], truncated: bool) {
+    let text = String::from_utf8_lossy(record);
+    let suffix = if truncated { " [truncated]" } else { "" };
+    let attributed = format!("[{}:{}] {}{}", process_name, stream_name, text, suffix);
+    if stream_name == "stderr" {
+        logging::error(&attributed);
+    } else {
+        logging::info(&attributed);
+    }
 }
 
 impl Supervisor {
@@ -247,8 +353,6 @@ impl Supervisor {
             processes: IndexMap::new(),
             shutdown,
             layer_binaries: IndexMap::new(),
-            #[cfg(windows)]
-            job: None,
         }
     }
 
@@ -261,6 +365,7 @@ impl Supervisor {
         compiled_extension_layers: &[&str],
     ) -> Result<(), Box<dyn Error>> {
         logging::info("Supervisor starting");
+        logging::ensure_healthy()?;
 
         signals::reset_shutdown();
         signals::install_shutdown_handler()?;
@@ -275,13 +380,21 @@ impl Supervisor {
         for (layer, path) in compiled_extension_binaries {
             self.layer_binaries.insert(layer, path);
         }
-        self.ensure_windows_job()?;
 
         let result = self.run_supervision_loop(planned_mesh_layers);
 
         logging::info("Supervisor shutting down");
-        self.stop_all();
-        result
+        let cleanup = self.stop_all();
+        match (result, cleanup) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(error), Ok(())) => Err(error),
+            (Ok(()), Err(cleanup_error)) => Err(cleanup_error.into()),
+            (Err(error), Err(cleanup_error)) => Err(io::Error::other(format!(
+                "{}; supervisor cleanup also failed: {}",
+                error, cleanup_error
+            ))
+            .into()),
+        }
     }
 
     fn run_supervision_loop(
@@ -290,19 +403,36 @@ impl Supervisor {
     ) -> Result<(), Box<dyn Error>> {
         for (mesh_name, layers) in planned_mesh_layers {
             self.start_mesh_layers(&mesh_name, &layers)?;
+            logging::ensure_healthy()?;
         }
 
-        while !self.shutdown.load(Ordering::SeqCst) && !signals::shutdown_requested() {
+        if self.wait_interruptibly(STARTUP_CHECK_DELAY) {
             self.poll_processes()?;
-            thread::sleep(HEALTH_CHECK_INTERVAL);
+            logging::ensure_healthy()?;
+        }
+
+        while !self.shutdown_requested() {
+            if !self.wait_interruptibly(HEALTH_CHECK_INTERVAL) {
+                break;
+            }
+            logging::ensure_healthy()?;
+            self.poll_processes()?;
+            logging::ensure_healthy()?;
         }
 
         Ok(())
     }
 
     fn poll_processes(&mut self) -> Result<(), Box<dyn Error>> {
+        self.poll_processes_with_restart_delay(RESTART_DELAY)
+    }
+
+    fn poll_processes_with_restart_delay(
+        &mut self,
+        restart_delay: Duration,
+    ) -> Result<(), Box<dyn Error>> {
         let restart_policy = self.config.options.restart.clone();
-        let mut exited: Vec<(String, Option<(String, String)>)> = Vec::new();
+        let mut exited = Vec::new();
 
         for (key, handle) in self.processes.iter_mut() {
             match handle.child.try_wait() {
@@ -314,31 +444,132 @@ impl Supervisor {
                     };
                     if should_restart {
                         logging::warn(&format!("{} exited ({}), scheduling restart", key, status));
-                        exited.push((
-                            key.clone(),
-                            Some((handle.mesh.clone(), handle.layer.clone())),
-                        ));
                     } else {
-                        logging::info(&format!("{} exited ({}), no restart", key, status));
-                        exited.push((key.clone(), None));
+                        logging::error(&format!(
+                            "{} exited ({}) and restart policy '{}' does not permit restart",
+                            key, status, restart_policy
+                        ));
                     }
+                    exited.push((
+                        key.clone(),
+                        handle.mesh.clone(),
+                        handle.layer.clone(),
+                        handle.restart_count.saturating_add(1),
+                        should_restart,
+                        status.to_string(),
+                        is_core_runtime_layer(&handle.layer),
+                    ));
                 }
                 Ok(None) => {}
-                Err(e) => logging::error(&format!("Failed to poll {}: {}", key, e)),
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("Failed to poll required layer {}: {}", key, error),
+                    )
+                    .into());
+                }
             }
         }
 
-        for (key, restart) in exited {
-            if let Some(mut handle) = self.processes.shift_remove(&key) {
-                handle.join_output_readers();
+        let mut layer_restarts = Vec::new();
+        let mut core_mesh_restarts = IndexMap::new();
+        let mut fatal_exits = Vec::new();
+        let mut cleanup_errors = Vec::new();
+        for (key, mesh, layer, restart_count, should_restart, status, core_layer) in exited {
+            if let Some(handle) = self.processes.shift_remove(&key) {
+                if let Err(error) = self.stop_process(handle) {
+                    cleanup_errors.push(error.to_string());
+                }
             }
-            if let Some((mesh, layer)) = restart {
-                thread::sleep(RESTART_DELAY);
-                self.start_layer(&mesh, &layer)?;
+            if should_restart {
+                if core_layer {
+                    core_mesh_restarts.insert(mesh, ());
+                } else {
+                    layer_restarts.push((mesh, layer, restart_count));
+                }
+            } else {
+                fatal_exits.push(format!("{} exited ({})", key, status));
+            }
+        }
+
+        if !cleanup_errors.is_empty() {
+            return Err(io::Error::other(format!(
+                "Failed to clean exited process families: {}",
+                cleanup_errors.join("; ")
+            ))
+            .into());
+        }
+
+        if !fatal_exits.is_empty() {
+            return Err(io::Error::other(format!(
+                "Required supervised layer is unavailable: {}",
+                fatal_exits.join("; ")
+            ))
+            .into());
+        }
+
+        let mut mesh_restarts = Vec::new();
+        for mesh in core_mesh_restarts.keys() {
+            let mesh_config = self.config.meshes.get(mesh).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Missing configuration for running mesh '{}'", mesh),
+                )
+            })?;
+            mesh_restarts.push((mesh.clone(), Self::layers_for_mesh(mesh_config)?));
+        }
+
+        for (mesh, _) in &mesh_restarts {
+            if let Err(error) = self.stop_mesh_checked(mesh) {
+                cleanup_errors.push(error.to_string());
+            }
+        }
+        if !cleanup_errors.is_empty() {
+            return Err(io::Error::other(format!(
+                "Failed to quiesce Core mesh before restart: {}",
+                cleanup_errors.join("; ")
+            ))
+            .into());
+        }
+
+        layer_restarts.retain(|(mesh, _, _)| !core_mesh_restarts.contains_key(mesh));
+        if (!mesh_restarts.is_empty() || !layer_restarts.is_empty())
+            && self.wait_interruptibly(restart_delay)
+        {
+            for (mesh, layers) in mesh_restarts {
+                if self.shutdown_requested() {
+                    break;
+                }
+                self.start_mesh_layers(&mesh, &layers)?;
+                logging::ensure_healthy()?;
+            }
+
+            for (mesh, layer, restart_count) in layer_restarts {
+                if self.shutdown_requested() {
+                    break;
+                }
+                self.start_layer_with_restart_count(&mesh, &layer, restart_count)?;
+                logging::ensure_healthy()?;
             }
         }
 
         Ok(())
+    }
+
+    fn shutdown_requested(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst) || signals::shutdown_requested()
+    }
+
+    fn wait_interruptibly(&self, duration: Duration) -> bool {
+        let deadline = Instant::now() + duration;
+        while !self.shutdown_requested() {
+            let now = Instant::now();
+            if now >= deadline {
+                return true;
+            }
+            thread::sleep(INTERRUPT_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
+        }
+        false
     }
 
     #[allow(dead_code)]
@@ -362,10 +593,55 @@ impl Supervisor {
         mesh_name: &str,
         layers: &[String],
     ) -> Result<(), Box<dyn Error>> {
+        let mut started = Vec::new();
         for layer in layers {
-            self.start_layer(mesh_name, layer)?;
+            if self.shutdown_requested() {
+                let error = io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    format!("Shutdown requested while starting mesh '{}'", mesh_name),
+                );
+                return self.rollback_started_layers(started, error.into());
+            }
+
+            let process_name = format!("aigosd-{}@{}", mesh_name, layer);
+            let already_running = self.processes.contains_key(&process_name);
+            if let Err(error) = self.start_layer(mesh_name, layer) {
+                return self.rollback_started_layers(started, error);
+            }
+            if !already_running {
+                started.push(process_name);
+            }
+            if let Err(error) = logging::ensure_healthy() {
+                return self.rollback_started_layers(started, error.into());
+            }
         }
         Ok(())
+    }
+
+    fn rollback_started_layers(
+        &mut self,
+        started: Vec<String>,
+        start_error: Box<dyn Error>,
+    ) -> Result<(), Box<dyn Error>> {
+        let mut cleanup_errors = Vec::new();
+        for process_name in started.into_iter().rev() {
+            if let Some(handle) = self.processes.shift_remove(&process_name) {
+                if let Err(error) = self.stop_process(handle) {
+                    cleanup_errors.push(error.to_string());
+                }
+            }
+        }
+
+        if cleanup_errors.is_empty() {
+            Err(start_error)
+        } else {
+            Err(io::Error::other(format!(
+                "{}; startup rollback also failed: {}",
+                start_error,
+                cleanup_errors.join("; ")
+            ))
+            .into())
+        }
     }
 
     fn planned_mesh_layers(&self) -> Result<PlannedMeshLayers, Box<dyn Error>> {
@@ -422,6 +698,12 @@ impl Supervisor {
 
     #[allow(dead_code)]
     pub fn stop_mesh(&mut self, mesh_name: &str) {
+        if let Err(error) = self.stop_mesh_checked(mesh_name) {
+            logging::error(&format!("Failed to stop mesh '{}': {}", mesh_name, error));
+        }
+    }
+
+    fn stop_mesh_checked(&mut self, mesh_name: &str) -> io::Result<()> {
         let prefix = format!("aigosd-{}@", mesh_name);
         let to_stop: Vec<_> = self
             .processes
@@ -430,54 +712,112 @@ impl Supervisor {
             .cloned()
             .collect();
 
+        let mut errors = Vec::new();
         for key in to_stop {
             if let Some(handle) = self.processes.shift_remove(&key) {
-                self.stop_process(handle);
+                if let Err(error) = self.stop_process(handle) {
+                    errors.push(error.to_string());
+                }
             }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(errors.join("; ")))
         }
     }
 
-    fn stop_all(&mut self) {
+    fn stop_all(&mut self) -> io::Result<()> {
         let keys: Vec<_> = self.processes.keys().cloned().collect();
+        let mut errors = Vec::new();
         for key in keys {
             if let Some(handle) = self.processes.shift_remove(&key) {
-                self.stop_process(handle);
+                if let Err(error) = self.stop_process(handle) {
+                    errors.push(error.to_string());
+                }
             }
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(errors.join("; ")))
         }
     }
 
-    fn stop_process(&self, mut handle: ProcessHandle) {
+    fn stop_process(&self, mut handle: ProcessHandle) -> io::Result<()> {
         logging::info(&format!(
             "Stopping {} [PID {}, restarts {}]",
             handle.name, handle.pid, handle.restart_count
         ));
 
+        let mut errors = Vec::new();
         match handle.child.try_wait() {
             Ok(Some(status)) => {
                 logging::info(&format!("{} already exited ({})", handle.name, status));
-                handle.join_output_readers();
-                return;
             }
             Ok(None) => {}
-            Err(e) => logging::warn(&format!(
-                "Failed to inspect {} before stop: {}",
-                handle.name, e
-            )),
+            Err(error) => {
+                logging::warn(&format!(
+                    "Failed to inspect {} before stop: {}",
+                    handle.name, error
+                ));
+                errors.push(error.to_string());
+            }
         }
 
-        self.terminate_process_group_or_child(&mut handle);
-
-        if let Err(e) = handle.child.wait() {
-            logging::warn(&format!("Failed to reap {}: {}", handle.name, e));
+        if let Err(error) = self.terminate_process_group_or_child(&mut handle) {
+            errors.push(error.to_string());
         }
-        handle.join_output_readers();
+
+        if let Err(error) = Self::wait_for_child_exit(&mut handle) {
+            logging::warn(&format!("Failed to reap {}: {}", handle.name, error));
+            errors.push(error.to_string());
+        }
+        if let Err(error) = handle.join_output_readers() {
+            errors.push(error.to_string());
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(io::Error::other(format!(
+                "{}: {}",
+                handle.name,
+                errors.join("; ")
+            )))
+        }
+    }
+
+    fn wait_for_child_exit(handle: &mut ProcessHandle) -> io::Result<()> {
+        let deadline = Instant::now() + PROCESS_REAP_TIMEOUT;
+        loop {
+            match handle.child.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) if Instant::now() < deadline => {
+                    thread::sleep(INTERRUPT_POLL_INTERVAL);
+                }
+                Ok(None) => {
+                    let _ = handle.child.kill();
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("timed out waiting for {} to exit", handle.name),
+                    ));
+                }
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     #[cfg(unix)]
-    fn terminate_process_group_or_child(&self, handle: &mut ProcessHandle) {
-        if let Err(e) = kill_process_group(handle.process_group_id, SIGTERM) {
-            log_process_group_signal_error("SIGTERM", handle, e);
-        }
+    fn terminate_process_group_or_child(&self, handle: &mut ProcessHandle) -> io::Result<()> {
+        let mut first_error = process_group_signal_result(
+            "SIGTERM",
+            handle,
+            kill_process_group(handle.process_group_id, SIGTERM),
+        )
+        .err();
 
         let deadline = Instant::now() + PROCESS_GROUP_TERM_TIMEOUT;
         while Instant::now() < deadline {
@@ -489,30 +829,58 @@ impl Supervisor {
                         "Failed to inspect {} after SIGTERM: {}",
                         handle.name, e
                     ));
+                    if first_error.is_none() {
+                        first_error = Some(e);
+                    }
                     break;
                 }
             }
         }
 
-        if let Err(e) = kill_process_group(handle.process_group_id, SIGKILL) {
-            log_process_group_signal_error("SIGKILL", handle, e);
+        if let Err(error) = process_group_signal_result(
+            "SIGKILL",
+            handle,
+            kill_process_group(handle.process_group_id, SIGKILL),
+        ) {
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
+        }
+
+        first_error.map_or(Ok(()), Err)
+    }
+
+    #[cfg(windows)]
+    fn terminate_process_group_or_child(&self, handle: &mut ProcessHandle) -> io::Result<()> {
+        if let Some(job) = handle.job.take() {
+            drop(job);
+            Ok(())
+        } else {
+            handle.child.kill()
         }
     }
 
-    #[cfg(not(unix))]
-    fn terminate_process_group_or_child(&self, handle: &mut ProcessHandle) {
-        if let Err(e) = handle.child.kill() {
-            logging::warn(&format!("Failed to kill {}: {}", handle.name, e));
-        }
+    #[cfg(all(not(unix), not(windows)))]
+    fn terminate_process_group_or_child(&self, handle: &mut ProcessHandle) -> io::Result<()> {
+        handle.child.kill()
     }
 
     #[allow(dead_code)]
     pub fn restart_mesh(&mut self, mesh_name: &str) -> Result<(), Box<dyn Error>> {
-        self.stop_mesh(mesh_name);
+        self.stop_mesh_checked(mesh_name)?;
         self.start_mesh(mesh_name)
     }
 
     pub fn start_layer(&mut self, mesh_name: &str, layer_name: &str) -> Result<(), Box<dyn Error>> {
+        self.start_layer_with_restart_count(mesh_name, layer_name, 0)
+    }
+
+    fn start_layer_with_restart_count(
+        &mut self,
+        mesh_name: &str,
+        layer_name: &str,
+        restart_count: u32,
+    ) -> Result<(), Box<dyn Error>> {
         let process_name = format!("aigosd-{}@{}", mesh_name, layer_name);
 
         if self.processes.contains_key(&process_name) {
@@ -520,37 +888,82 @@ impl Supervisor {
             return Ok(());
         }
 
-        self.ensure_windows_job()?;
+        if self.shutdown_requested() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                format!("Shutdown requested before starting {}", process_name),
+            )
+            .into());
+        }
 
         let bin_path = self.layer_binary_path(layer_name)?;
-        println!("AIGOSD trying to spawn: {}", bin_path.display());
+        logging::info(&format!("Trying to spawn {}", bin_path.display()));
+        logging::ensure_healthy()?;
         let mut cmd = Command::new(&bin_path);
         cmd.arg("--mesh").arg(mesh_name);
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped());
         configure_child_process_group(&mut cmd);
 
+        #[cfg(windows)]
+        let process_job = crate::windows::JobObject::new()?;
+
         match cmd.spawn() {
-            Ok(child) => {
-                let child = self.assign_child_to_platform_supervisor(child, &process_name)?;
-                let mut child = child;
+            Ok(mut child) => {
+                #[cfg(windows)]
+                if let Err(error) = process_job.assign_child(&child) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "Failed to assign {} to Windows job object: {}",
+                            process_name, error
+                        ),
+                    )
+                    .into());
+                }
+
+                #[cfg(windows)]
+                if let Err(error) = crate::windows::resume_child(&child) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!(
+                            "Failed to resume contained process {}: {}",
+                            process_name, error
+                        ),
+                    )
+                    .into());
+                }
+
                 let output_readers = start_output_readers(&process_name, &mut child);
                 let pid = child.id();
-                let name_clone = process_name.clone();
-                self.processes.insert(
-                    process_name.clone(),
-                    ProcessHandle {
-                        name: name_clone,
-                        pid,
-                        layer: layer_name.to_string(),
-                        mesh: mesh_name.to_string(),
-                        child,
-                        started_at: Instant::now(),
-                        restart_count: 0,
-                        output_readers,
-                        #[cfg(unix)]
-                        process_group_id: pid as i32,
-                    },
-                );
+                let handle = ProcessHandle {
+                    name: process_name.clone(),
+                    pid,
+                    layer: layer_name.to_string(),
+                    mesh: mesh_name.to_string(),
+                    child,
+                    started_at: Instant::now(),
+                    restart_count,
+                    output_readers,
+                    #[cfg(unix)]
+                    process_group_id: pid as i32,
+                    #[cfg(windows)]
+                    job: Some(process_job),
+                };
+
+                if self.shutdown_requested() {
+                    self.stop_process(handle)?;
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        format!("Shutdown requested while starting {}", process_name),
+                    )
+                    .into());
+                }
+
+                self.processes.insert(process_name.clone(), handle);
                 logging::info(&format!("Started {} [PID {}]", process_name, pid));
                 Ok(())
             }
@@ -565,39 +978,6 @@ impl Supervisor {
             )
             .into()),
         }
-    }
-
-    #[cfg(windows)]
-    fn assign_child_to_platform_supervisor(
-        &self,
-        mut child: Child,
-        process_name: &str,
-    ) -> Result<Child, Box<dyn Error>> {
-        if let Some(job) = self.job.as_ref() {
-            if let Err(e) = job.assign_child(&child) {
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(io::Error::new(
-                    e.kind(),
-                    format!(
-                        "Failed to assign {} to Windows job object: {}",
-                        process_name, e
-                    ),
-                )
-                .into());
-            }
-        }
-
-        Ok(child)
-    }
-
-    #[cfg(not(windows))]
-    fn assign_child_to_platform_supervisor(
-        &self,
-        child: Child,
-        _process_name: &str,
-    ) -> Result<Child, Box<dyn Error>> {
-        Ok(child)
     }
 
     fn layer_binary_path(&self, layer_name: &str) -> Result<PathBuf, MissingCoreLayersError> {
@@ -685,37 +1065,25 @@ impl Supervisor {
         }
     }
 
-    #[cfg(windows)]
-    fn ensure_windows_job(&mut self) -> Result<(), Box<dyn Error>> {
-        if self.job.is_none() {
-            self.job = Some(crate::windows::JobObject::new()?);
-        }
-        Ok(())
-    }
-
-    #[cfg(not(windows))]
-    fn ensure_windows_job(&mut self) -> Result<(), Box<dyn Error>> {
-        Ok(())
-    }
-
     #[allow(dead_code)]
     pub fn process_exists(&self, name: &str) -> bool {
         self.processes.contains_key(name)
     }
 
     #[allow(dead_code)]
-    pub fn health_check(&self, name: &str) -> bool {
-        if let Some(handle) = self.processes.get(name) {
+    pub fn health_check(&mut self, name: &str) -> bool {
+        self.processes.get_mut(name).is_some_and(|handle| {
             handle.started_at.elapsed() > Duration::from_secs(1)
-        } else {
-            false
-        }
+                && matches!(handle.child.try_wait(), Ok(None))
+        })
     }
 }
 
 impl Drop for Supervisor {
     fn drop(&mut self) {
-        self.stop_all();
+        if let Err(error) = self.stop_all() {
+            logging::error(&format!("Supervisor drop cleanup failed: {}", error));
+        }
     }
 }
 
@@ -1215,8 +1583,8 @@ options:
         let runtime = RuntimeDir::new();
         let helper = compile_output_helper(&runtime.path);
         let log_path = runtime.path.join("aigosd-output.log");
-        let log_path_string = log_path.display().to_string();
-        crate::logging::init("plaintext", Some(&log_path_string));
+        crate::logging::init("plaintext", Some("aigosd-output.log"))
+            .expect("initialize supervisor smoke-test logger");
 
         let layer = canonical_core_layers()[0];
         let path = Supervisor::candidate_layer_paths(layer)[0].clone();
@@ -1238,7 +1606,9 @@ options:
             .shift_remove(&process_name)
             .expect("started process");
         let status = handle.child.wait().expect("wait for output helper");
-        handle.join_output_readers();
+        handle
+            .join_output_readers()
+            .expect("join output helper readers");
         assert!(status.success(), "output helper should exit successfully");
 
         let contents = fs::read_to_string(&log_path).expect("read output log");
@@ -1278,6 +1648,205 @@ options:
                 line
             );
         }
+
+        crate::logging::init("plaintext", None).expect("release output capture log");
+    }
+
+    #[test]
+    fn oversized_non_newline_output_is_bounded_and_marked_truncated() {
+        let _lock = CWD_LOCK.lock().expect("cwd lock");
+        let runtime = RuntimeDir::new();
+        let log_path = runtime.path.join("bounded-output.log");
+        crate::logging::init("plaintext", Some("bounded-output.log"))
+            .expect("initialize bounded output log");
+
+        let data = vec![b'x'; MAX_OUTPUT_RECORD_BYTES * 4];
+        let mut output_reader = spawn_output_reader(
+            "aigosd-mesh@dio".to_string(),
+            "stdout",
+            BufReader::new(std::io::Cursor::new(data)),
+        );
+        output_reader
+            .completed
+            .recv_timeout(Duration::from_secs(2))
+            .expect("bounded output reader should complete");
+        output_reader
+            .thread
+            .take()
+            .expect("output reader thread")
+            .join()
+            .expect("output reader should not panic");
+
+        crate::logging::init("plaintext", None).expect("release bounded output log");
+        let contents = fs::read(&log_path).expect("read bounded output log");
+        assert!(
+            contents
+                .windows(b"[truncated]".len())
+                .any(|window| window == b"[truncated]"),
+            "oversized record should be identified as truncated"
+        );
+        assert!(
+            contents.len() <= MAX_OUTPUT_RECORD_BYTES + 512,
+            "bounded record unexpectedly used {} bytes",
+            contents.len()
+        );
+    }
+
+    #[test]
+    fn output_reader_timeout_is_a_cleanup_error() {
+        let (completed_tx, completed) = mpsc::channel();
+        let (release_tx, release) = mpsc::channel();
+        let thread = thread::spawn(move || {
+            release.recv().expect("release reader thread");
+            completed_tx.send(()).expect("report reader completion");
+        });
+        let mut output_reader = OutputReader {
+            thread: Some(thread),
+            completed,
+        };
+
+        let error = output_reader
+            .join_with_timeout("aigosd-mesh@dio", Duration::from_millis(10))
+            .expect_err("reader timeout must fail cleanup");
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+
+        release_tx.send(()).expect("release reader thread");
+        output_reader
+            .thread
+            .take()
+            .expect("reader thread")
+            .join()
+            .expect("reader thread should finish");
+    }
+
+    #[test]
+    fn required_layer_exit_is_fatal_when_policy_does_not_restart_it() {
+        let _lock = CWD_LOCK.lock().expect("cwd lock");
+        let runtime = RuntimeDir::new();
+        let helper = compile_output_helper(&runtime.path);
+        let layer = canonical_core_layers()[0];
+
+        for restart_policy in ["never", "on-failure"] {
+            let mut config = test_config(None);
+            config.options.restart = restart_policy.to_string();
+            let mut supervisor = Supervisor::new(config);
+            supervisor
+                .layer_binaries
+                .insert(layer.to_string(), helper.clone());
+            supervisor
+                .start_layer("mesh", layer)
+                .expect("start exiting helper layer");
+
+            wait_for_layer_exit(&mut supervisor, "mesh", layer);
+            let error = supervisor
+                .poll_processes()
+                .expect_err("required layer loss must terminate supervision");
+
+            assert!(error
+                .to_string()
+                .contains("Required supervised layer is unavailable"));
+            assert!(supervisor.processes.is_empty());
+        }
+    }
+
+    #[test]
+    fn restartable_core_exit_quiesces_the_mesh_before_restart() {
+        let _lock = CWD_LOCK.lock().expect("cwd lock");
+        let runtime = RuntimeDir::new();
+        let exiting_helper = compile_output_helper(&runtime.path);
+        let sleeping_helper = compile_sleeping_helper(&runtime.path);
+        let failed_layer = canonical_core_layers()[0];
+        let peer_layer = canonical_core_layers()[1];
+
+        let mut config = test_config(None);
+        config.options.restart = "always".to_string();
+        let mut supervisor = Supervisor::new(config);
+        supervisor
+            .layer_binaries
+            .insert(failed_layer.to_string(), exiting_helper);
+        supervisor
+            .layer_binaries
+            .insert(peer_layer.to_string(), sleeping_helper);
+        supervisor
+            .start_layer("mesh", failed_layer)
+            .expect("start exiting Core helper");
+        supervisor
+            .start_layer("mesh", peer_layer)
+            .expect("start peer Core helper");
+
+        let peer_name = format!("aigosd-mesh@{}", peer_layer);
+        let peer_pid = supervisor
+            .processes
+            .get(&peer_name)
+            .expect("peer Core handle")
+            .pid;
+        wait_for_layer_exit(&mut supervisor, "mesh", failed_layer);
+
+        supervisor
+            .poll_processes_with_restart_delay(Duration::ZERO)
+            .expect_err("incomplete restart fixtures should fail after quiescing the mesh");
+        wait_until_stopped(peer_pid);
+
+        assert!(
+            !process_is_running(peer_pid),
+            "peer Core process must stop when any Core layer is lost"
+        );
+        assert!(
+            supervisor.processes.is_empty(),
+            "failed transactional mesh restart must leave no partial Core"
+        );
+    }
+
+    #[test]
+    fn mesh_start_rolls_back_layers_after_later_spawn_failure() {
+        let _lock = CWD_LOCK.lock().expect("cwd lock");
+        let runtime = RuntimeDir::new();
+        let helper = compile_sleeping_helper(&runtime.path);
+        let invalid = runtime.path.join(if cfg!(windows) {
+            "invalid-layer.exe"
+        } else {
+            "invalid-layer"
+        });
+        create_empty_executable(&invalid);
+
+        let first_layer = canonical_core_layers()[0];
+        let second_layer = canonical_core_layers()[1];
+        let mut supervisor = Supervisor::new(test_config(None));
+        supervisor
+            .layer_binaries
+            .insert(first_layer.to_string(), helper);
+        supervisor
+            .layer_binaries
+            .insert(second_layer.to_string(), invalid);
+
+        let error = supervisor
+            .start_mesh_layers("mesh", &[first_layer.to_string(), second_layer.to_string()])
+            .expect_err("later spawn failure should fail the mesh start");
+
+        assert!(error.to_string().contains("Failed to start"));
+        assert!(
+            supervisor.processes.is_empty(),
+            "startup rollback must remove every layer started by this call"
+        );
+    }
+
+    #[test]
+    fn shutdown_interrupts_restart_wait_and_prevents_new_spawn() {
+        let mut supervisor = Supervisor::new(test_config(None));
+        supervisor.shutdown.store(true, Ordering::SeqCst);
+
+        let started = Instant::now();
+        assert!(!supervisor.wait_interruptibly(RESTART_DELAY));
+        assert!(started.elapsed() < Duration::from_millis(500));
+
+        let error = supervisor
+            .start_layer("mesh", canonical_core_layers()[0])
+            .expect_err("shutdown must prevent new layer spawn");
+        assert_eq!(
+            error.downcast_ref::<io::Error>().map(io::Error::kind),
+            Some(io::ErrorKind::Interrupted)
+        );
+        assert!(supervisor.processes.is_empty());
     }
 
     #[cfg(unix)]
@@ -1332,6 +1901,50 @@ options:
         assert!(
             !process_is_running(grandchild_pid),
             "grandchild process group member should be stopped after drop"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shutdown_terminates_spawned_process_tree() {
+        let _lock = CWD_LOCK.lock().expect("cwd lock");
+        let runtime = RuntimeDir::new();
+        let helper = compile_windows_process_tree_helper(&runtime.path);
+        let grandchild_pid_file = runtime.path.join("windows-grandchild.pid");
+        let layer = canonical_core_layers()[0];
+
+        env::set_var("AIGOSD_TEST_GRANDCHILD_PID", &grandchild_pid_file);
+        let mut supervisor = Supervisor::new(test_config(None));
+        supervisor.layer_binaries.insert(layer.to_string(), helper);
+        supervisor
+            .start_layer("mesh", layer)
+            .expect("start Windows process-tree helper layer");
+        env::remove_var("AIGOSD_TEST_GRANDCHILD_PID");
+
+        let process_name = format!("aigosd-mesh@{}", layer);
+        let pid = supervisor
+            .processes
+            .get(&process_name)
+            .expect("started process")
+            .pid;
+        let grandchild_pid = wait_for_pid_file(&grandchild_pid_file);
+
+        assert!(
+            process_is_running(pid),
+            "child should be running before drop"
+        );
+        assert!(
+            process_is_running(grandchild_pid),
+            "grandchild should be running before drop"
+        );
+
+        drop(supervisor);
+        wait_until_stopped(pid);
+        wait_until_stopped(grandchild_pid);
+        assert!(!process_is_running(pid), "child should stop after drop");
+        assert!(
+            !process_is_running(grandchild_pid),
+            "contained grandchild should stop after drop"
         );
     }
 
@@ -1487,7 +2100,52 @@ fn main() {
         output
     }
 
-    #[cfg(unix)]
+    #[cfg(windows)]
+    fn compile_windows_process_tree_helper(runtime: &Path) -> PathBuf {
+        let source = runtime.join("windows_process_tree_layer.rs");
+        let output = runtime.join("windows_process_tree_layer.exe");
+        fs::write(
+            &source,
+            r#"
+use std::env;
+use std::fs;
+use std::process::Command;
+use std::thread;
+use std::time::Duration;
+
+fn main() {
+    if env::args().any(|arg| arg == "--aigosd-test-grandchild") {
+        loop {
+            thread::sleep(Duration::from_secs(60));
+        }
+    }
+
+    let pid_file = env::var("AIGOSD_TEST_GRANDCHILD_PID").expect("pid file env");
+    let child = Command::new(env::current_exe().expect("current executable"))
+        .arg("--aigosd-test-grandchild")
+        .spawn()
+        .expect("spawn grandchild");
+    fs::write(pid_file, child.id().to_string()).expect("write grandchild pid");
+
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
+}
+"#,
+        )
+        .expect("write Windows process-tree helper source");
+
+        let status = Command::new("rustc")
+            .arg(&source)
+            .arg("-O")
+            .arg("-o")
+            .arg(&output)
+            .status()
+            .expect("run rustc for Windows process-tree helper");
+        assert!(status.success(), "process-tree helper should compile");
+        output
+    }
+
     fn wait_for_pid_file(path: &PathBuf) -> u32 {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
@@ -1503,6 +2161,28 @@ fn main() {
                 path.display()
             );
             thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn wait_for_layer_exit(supervisor: &mut Supervisor, mesh: &str, layer: &str) {
+        let process_name = format!("aigosd-{}@{}", mesh, layer);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let handle = supervisor
+                .processes
+                .get_mut(&process_name)
+                .expect("started layer handle");
+            match handle.child.try_wait().expect("poll helper layer") {
+                Some(_) => return,
+                None => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "timed out waiting for {} to exit",
+                        process_name
+                    );
+                    thread::sleep(Duration::from_millis(25));
+                }
+            }
         }
     }
 
