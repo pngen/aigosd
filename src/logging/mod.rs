@@ -38,26 +38,32 @@ struct Logger {
 
 #[derive(Serialize)]
 struct StructuredRecord<'a> {
-    ts: u64,
+    ts: &'a serde_json::value::RawValue,
     level: &'static str,
     msg: &'a str,
 }
 
 impl Logger {
     fn format_msg(&self, level: Level, msg: &str) -> io::Result<String> {
-        let ts = SystemTime::now()
+        let elapsed = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
-            .map(|d| d.as_secs())
-            .unwrap_or(0);
+            .unwrap_or_default();
         if self.structured {
+            let millis = elapsed.as_millis();
+            let ts = serde_json::value::RawValue::from_string(format!(
+                "{}.{:03}",
+                millis / 1000,
+                millis % 1000
+            ))
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
             serde_json::to_string(&StructuredRecord {
-                ts,
+                ts: &ts,
                 level: level.as_str(),
                 msg,
             })
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
         } else {
-            Ok(format!("[{}] [{}] {}", ts, level.as_str(), msg))
+            Ok(format!("[{}] [{}] {}", elapsed.as_secs(), level.as_str(), msg))
         }
     }
 
@@ -563,6 +569,55 @@ mod tests {
 
         assert_eq!(value["level"], "ERROR");
         assert_eq!(value["msg"], message);
+    }
+
+    #[test]
+    fn structured_ts_uses_millisecond_precision_with_epoch_semantics() {
+        let logger = Logger {
+            file: None,
+            structured: true,
+            min_level: Level::Info,
+        };
+        let line = logger
+            .format_msg(Level::Info, "timestamp precision")
+            .expect("serialize structured record");
+        let value: serde_json::Value = serde_json::from_str(&line).expect("valid JSON log");
+        assert_eq!(value["level"], "INFO");
+        assert_eq!(value["msg"], "timestamp precision");
+
+        // The emitted ts token itself must carry exactly three fractional digits.
+        let ts_text = line
+            .split_once("\"ts\":")
+            .expect("structured log must contain a ts field")
+            .1
+            .split([',', '}'])
+            .next()
+            .expect("ts field must be terminated");
+        let (whole, fraction) = ts_text
+            .split_once('.')
+            .expect("ts must include a fractional part");
+        assert!(
+            !whole.is_empty() && whole.chars().all(|c| c.is_ascii_digit()),
+            "ts integer part must be whole epoch seconds: {ts_text}"
+        );
+        assert_eq!(
+            fraction.len(),
+            3,
+            "ts must have exactly three fractional digits: {ts_text}"
+        );
+        assert!(fraction.chars().all(|c| c.is_ascii_digit()));
+
+        // The parsed value must remain Unix epoch seconds close to the wall clock.
+        let ts = value["ts"].as_f64().expect("ts must remain a JSON number");
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system time")
+            .as_secs_f64();
+        assert!(
+            (now - ts).abs() < 2.0,
+            "ts must reflect current epoch seconds: {ts} vs {now}"
+        );
+        assert!((0.0..1.0).contains(&ts.fract()));
     }
 
     #[test]
