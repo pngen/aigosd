@@ -10,9 +10,9 @@ mod systemd;
 mod windows;
 
 fn config_path() -> PathBuf {
-    env::var("AIGOSD_CONFIG")
+    env::var_os("AIGOSD_CONFIG")
         .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("config.yaml"))
+        .unwrap_or_else(|| PathBuf::from("config.yaml"))
 }
 
 fn main() {
@@ -93,5 +93,29 @@ mod tests {
         assert_eq!(config_path(), PathBuf::from("custom.yaml"));
 
         restore_env(previous);
+    }
+
+    #[test]
+    fn config_path_honors_explicit_override_that_is_not_valid_unicode() {
+        #[cfg(unix)]
+        let selected = {
+            use std::os::unix::ffi::OsStringExt;
+            OsString::from_vec(b"custom-\xFF.yaml".to_vec())
+        };
+        #[cfg(windows)]
+        let selected = {
+            use std::os::windows::ffi::OsStringExt;
+            OsString::from_wide(&[0x0063, 0xD800, 0x002E, 0x0079, 0x0061, 0x006D, 0x006C])
+        };
+
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let previous = env::var_os("AIGOSD_CONFIG");
+        env::set_var("AIGOSD_CONFIG", &selected);
+
+        // An explicitly selected file must never be replaced by the local default.
+        let selected_path = config_path();
+        restore_env(previous);
+
+        assert_eq!(selected_path, PathBuf::from(selected));
     }
 }
